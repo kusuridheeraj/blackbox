@@ -1,0 +1,69 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: blackbox-gateway
+
+  # PostgreSQL
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:blackbox}
+    username: ${DB_USER:blackbox}
+    password: ${DB_PASSWORD:blackbox}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  # Redis
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2000ms
+
+# Gateway configuration
+gateway:
+  jwt:
+    secret: ${JWT_SECRET:blackbox-dev-secret-key-must-be-at-least-256-bits-long-for-hs256}
+    expiration-ms: 3600000  # 1 hour
+  routes:
+    - id: mock-backend
+      path-prefix: /api
+      target-url: ${BACKEND_URL:http://localhost:8081}
+  rate-limit:
+    default-requests-per-second: 100
+    default-burst-size: 150
+    tiers:
+      STANDARD:
+        requests-per-second: 50
+        burst-size: 75
+      PREMIUM:
+        requests-per-second: 200
+        burst-size: 300
+      INTERNAL:
+        requests-per-second: 1000
+        burst-size: 1500
+
+# Actuator + Prometheus
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: blackbox-gateway
+
+logging:
+  level:
+    com.blackbox: DEBUG
+    org.springframework.web: INFO

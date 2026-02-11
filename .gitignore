@@ -1,0 +1,32 @@
+# BLACKBOX build artifacts
+target/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+postgres-data/
+grafana-data/
+
+# Logs
+*.log
+
+# Environment
+.env
+
+# Blog drafts (not for repo)
+docs/blog-1-static-rate-limiting.md
+docs/blog-2-breaking-my-gateway.md
+
