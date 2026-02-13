@@ -103,11 +103,13 @@ public class GatewayMetrics {
 
     /**
      * Record circuit breaker state change.
+     * Registers a gauge that tracks circuit state (0=CLOSED, 1=OPEN, 2=HALF_OPEN)
      */
-    public void recordCircuitBreakerState(String route, String state) {
+    public void registerCircuitBreakerGauge(String route, java.util.function.ToDoubleFunction<String> stateSupplier) {
         registry.gauge("gateway_circuit_breaker_state",
                 io.micrometer.core.instrument.Tags.of("route", route),
-                stateToNumber(state));
+                route,
+                stateSupplier);
     }
 
     /**

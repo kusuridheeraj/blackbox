@@ -45,6 +45,20 @@ public class CircuitBreaker {
     }
 
     /**
+     * Register a gauge for a new route (call this when route is first discovered).
+     */
+    public void registerRouteGauge(String routeId) {
+        metrics.registerCircuitBreakerGauge(routeId, route -> {
+            CircuitState state = getState(route);
+            return switch (state) {
+                case CLOSED -> 0.0;
+                case OPEN -> 1.0;
+                case HALF_OPEN -> 2.0;
+            };
+        });
+    }
+
+    /**
      * Check if a request to this route should be allowed.
      *
      * @return true if request can proceed, false if circuit is open
@@ -124,7 +138,6 @@ public class CircuitBreaker {
 
     private void transitionTo(String routeId, CircuitState newState) {
         states.computeIfAbsent(routeId, k -> new AtomicReference<>(CircuitState.CLOSED)).set(newState);
-        metrics.recordCircuitBreakerState(routeId, newState.name());
 
         if (newState == CircuitState.OPEN) {
             openTimestamps.put(routeId, System.currentTimeMillis());

@@ -1,347 +1,743 @@
-# BLACKBOX — Architecture & Threat Model
+# BLACKBOX Architecture - Design Decisions & Tradeoffs
 
-## Adaptive API Gateway with Self-Healing Rate Limiting
-
-> A production-grade API Gateway that dynamically adjusts rate limits based on real-time
-> traffic patterns, failures, and abuse signals — without manual intervention.
-
----
-
-## 1. The Real Problem
-
-### Why Static Rate Limiting Fails
-
-In every production system I've seen, rate limiting is configured once and forgotten:
-
-```
-# Typical static config — set and forget
-rate_limit:
-  requests_per_second: 100
-  burst: 150
-```
-
-This creates two failure modes:
-1. **Too generous** — During an attack or cascade, 100 RPS per client still lets a botnet through
-2. **Too strict** — During a legitimate flash sale, real users get 429'd while the system has spare capacity
-
-**The core tension:** Static limits optimize for ONE traffic pattern. Real traffic has infinite patterns.
-
-### What Actually Happens During Incidents
-
-1. PagerDuty fires at 3 AM
-2. On-call engineer wakes up, opens dashboard
-3. Identifies abusive traffic pattern
-4. Manually adjusts rate limits via config push
-5. Waits for deployment to propagate
-6. **Total response time: 15–45 minutes**
-
-In those 45 minutes, downstream services are either overloaded or legitimate users are locked out.
-
-**BLACKBOX answers one question:**
-> "How can the gateway protect itself and its backends *automatically*, within seconds, not minutes?"
+**Author:** Engineering Team  
+**Last Updated:** February 2026  
+**Audience:** Engineers, Architects, Technical Decision Makers
 
 ---
 
-## 2. Failure Scenarios (Threat Model)
+## Table of Contents
 
-I assumed failure, not success. These are the 10 scenarios that shaped every design decision:
+1. [System Architecture](#system-architecture)
+2. [Technology Stack Decisions](#technology-stack-decisions)
+3. [Architectural Patterns](#architectural-patterns)
+4. [Design Tradeoffs](#design-tradeoffs)
+5. [Scalability Considerations](#scalability-considerations)
+6. [Security Architecture](#security-architecture)
 
-| # | Scenario | Impact | Probability |
-|---|----------|--------|-------------|
-| 1 | **Redis goes down** | Rate limit state lost, all clients appear "new" | Medium |
-| 2 | **Sudden 10× traffic spike** | Backend overwhelmed, cascading 5xx | High |
-| 3 | **Slow downstream** | Gateway threads blocked, connection pool exhaustion | High |
-| 4 | **JWT replay attack** | Unauthorized access with stolen token | Medium |
-| 5 | **Single abusive client** | One API key consuming 80% capacity | High |
-| 6 | **Partial backend failure** | Some instances healthy, some dead | High |
-| 7 | **Bad config pushed to Redis** | Corrupted rate limits (0 RPS or infinite) | Low |
-| 8 | **Cascading retry storm** | Gateway retries hammer failing backend | High |
-| 9 | **Clock skew across instances** | Token bucket windows misaligned | Low |
-| 10 | **Redis OOM under sustained attack** | Eviction of rate limit keys, limits reset | Medium |
+---
 
-### Failure Severity Classification
+## System Architecture
+
+### High-Level Components
 
 ```
-CRITICAL (system-wide impact):
-  → #2 Traffic spike
-  → #3 Slow downstream
-  → #8 Retry storm
+┌──────────────────────────────────────────────────────────────┐
+│                        CLIENTS                               │
+│         (Web Apps, Mobile Apps, Third-Party APIs)            │
+└────────────────┬────────────────────────────────┬────────────┘
+                 │                                 │
+         ┌───────▼────────┐              ┌────────▼───────┐
+         │  Load Balancer │              │ Load Balancer  │
+         │   (Future)     │              │   (Future)     │
+         └───────┬────────┘              └────────┬───────┘
+                 │                                 │
+         ┌───────▼──────────────────────────────┬─▼───────┐
+         │                                      │         │
+    ┌────▼─────┐  ┌────────────┐  ┌────────────▼───┐     │
+    │ Gateway  │  │  Gateway   │  │   Gateway      │     │
+    │Instance 1│  │ Instance 2 │  │  Instance N    │     │
+    └────┬─────┘  └─────┬──────┘  └─────┬──────────┘     │
+         │              │               │                 │
+         └──────────────┼───────────────┘                 │
+                        │                                 │
+         ┌──────────────▼────────────────┐                │
+         │   Shared Infrastructure       │                │
+         │  ┌────────┐    ┌──────────┐   │                │
+         │  │ Redis  │    │PostgreSQL│   │                │
+         │  │(State) │    │  (Audit) │   │                │
+         │  └────────┘    └──────────┘   │                │
+         └───────────────────────────────┘                │
+                        │                                 │
+         ┌──────────────▼────────────────┐                │
+         │   Monitoring & Observability  │                │
+         │  ┌───────────┐  ┌──────────┐  │                │
+         │  │Prometheus │  │ Grafana  │  │                │
+         │  │(Metrics)  │  │ (Dashboar│  │                │
+         │  └───────────┘  └──────────┘  │                │
+         └───────────────────────────────┘                │
+                        │                                 │
+         ┌──────────────▼─────────────────────────────────▼┐
+         │              Backend Services                    │
+         │  ┌─────────┐  ┌─────────┐  ┌───────────────┐    │
+         │  │Payments │  │  Users  │  │  Inventory    │... │
+         │  │ Service │  │ Service │  │   Service     │    │
+         │  └─────────┘  └─────────┘  └───────────────┘    │
+         └──────────────────────────────────────────────────┘
+```
 
-HIGH (degraded service):
-  → #1 Redis down
-  → #5 Abusive client
-  → #6 Partial backend failure
+### Why This Architecture?
 
-MODERATE (security/correctness):
-  → #4 JWT replay
-  → #7 Bad config
-  → #10 Redis OOM
+**1. Gateway as Reverse Proxy**
+- **Pattern:** Single entry point for all backend services
+- **Benefit:** Centralized security, rate limiting, monitoring
+- **Alternative:** Direct client-to-service calls
+  - ❌ Problem: Each service needs auth, rate limiting, monitoring
+  - ❌ Result: Code duplication, inconsistent policies
 
-LOW (edge case):
-  → #9 Clock skew
+**2. Shared Redis for State**
+- **Pattern:** Distributed cache for rate limit counters
+- **Benefit:** Multiple gateway instances share same view
+- **Alternative:** In-memory state
+  - ❌ Problem: Instance 1 allows 100 req/s, Instance 2 allows 100 req/s
+  - ❌ Result: User gets 200 req/s (bypassed limit!)
+
+**3. PostgreSQL for Audit Logs**
+- **Pattern:** Append-only log of all significant events
+- **Benefit:** Post-incident analysis, compliance, debugging
+- **Alternative:** No audit logs
+  - ❌ Problem: "Who changed rate limit at 3 AM?"
+  - ❌ Result: Can't answer
+
+**4. Prometheus + Grafana**
+- **Pattern:** Time-series metrics + visualization
+- **Benefit:** Real-time monitoring, alerting, SLA tracking
+- **Alternative:** Log-based monitoring
+  - ❌ Problem: Logs don't show trends (e.g., "latency increased 50%")
+  - ❌ Result: Reactive instead of proactive
+
+---
+
+## Technology Stack Decisions
+
+### Backend: Spring Boot (Java 21)
+
+**Why Java?**
+
+| Criterion | Java | Go | Node.js | Python |
+|-----------|------|----|---------| -------|
+| **Performance** | ⭐⭐⭐⭐ (JIT optimized) | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐ |
+| **Ecosystem** | ⭐⭐⭐⭐⭐ (Massive) | ⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| **Type Safety** | ⭐⭐⭐⭐⭐ (Compile-time) | ⭐⭐⭐⭐⭐ | ⭐⭐ (TypeScript) | ⭐ (MyPy) |
+| **Enterprise Adoption** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐ |
+| **Learning Curve** | ⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+
+**Decision: Java**
+- ✅ Enterprise standard (80% of Fortune 500 use Java)
+- ✅ Mature ecosystem (Spring Security, Spring Data, Micrometer)
+- ✅ Strong typing prevents bugs at compile time
+- ✅ Hiring pool (millions of Java developers)
+- ❌ Tradeoff: Slower startup than Go (3 seconds vs 0.1 seconds)
+- ❌ Tradeoff: Higher memory usage (500MB vs 50MB for Go)
+
+**When to choose Go instead:**
+- Building lightweight sidecar proxies
+- Need instant cold start (serverless)
+- Resource-constrained environments (IoT devices)
+
+**When to choose Node.js instead:**
+- Primarily I/O-bound workload (not CPU)
+- Frontend team wants same language
+- Need real-time websockets (chat, streaming)
+
+---
+
+**Why Spring Boot (not raw Java)?**
+
+**Spring Boot provides:**
+- **Embedded Server:** No need to deploy WAR to Tomcat
+- **Auto-configuration:** Sensible defaults, minimal XML
+- **Dependency Injection:** Testable, modular code
+- **Actuator:** Health checks, metrics endpoints
+- **Security:** JWT, OAuth2 out-of-box
+
+**Alternative: Micronaut, Quarkus**
+- ✅ Faster startup (GraalVM native)
+- ✅ Lower memory
+- ❌ Smaller ecosystem
+- ❌ Less mature
+
+**Decision:** Spring Boot for maturity, Micronaut/Quarkus for future optimization.
+
+---
+
+### Data Store: Redis
+
+**Why Redis for Rate Limiting?**
+
+**Requirements:**
+1. Atomic operations (increment counter)
+2. Sub-millisecond latency
+3. TTL (time-to-live) for auto-expiry
+4. Distributed (multi-instance access)
+
+**Options:**
+
+| Option | Latency | Atomic | TTL | Cost |
+|--------|---------|--------|-----|------|
+| **In-Memory (HashMap)** | 0.001ms | ❌ | ✅ | Free |
+| **Redis** | 0.5ms | ✅ | ✅ | $ |
+| **PostgreSQL** | 5ms | ✅ | ❌ | $$ |
+| **DynamoDB** | 10ms | ✅ | ✅ | $$$ |
+
+**Decision: Redis**
+- ✅ Fast enough (0.5ms << 50ms request latency)
+- ✅ Atomic Lua scripts (no race conditions)
+- ✅ TTL for auto-cleanup
+- ✅ Open-source (no vendor lock-in)
+- ❌ Tradeoff: Single point of failure (mitigated with Redis Sentinel/Cluster)
+
+**When to use DynamoDB instead:**
+- Already on AWS
+- Need multi-region replication
+- Cost is not a concern
+
+---
+
+### Data Store: PostgreSQL
+
+**Why PostgreSQL for Audit Logs?**
+
+**Requirements:**
+1. ACID transactions (don't lose audit records)
+2. Complex queries (filter by date, event type, client)
+3. Long-term retention (years)
+
+**Alternatives:**
+
+| Option | ACID | Query | Retention | Cost |
+|--------|------|-------|-----------|------|
+| **PostgreSQL** | ✅ | ✅ SQL | ✅ | $ |
+| **MongoDB** | ❌ | ⚠️ NoSQL | ✅ | $ |
+| **Elasticsearch** | ❌ | ✅ Full-text | ✅ | $$$ |
+| **S3 + Athena** | ❌ | ⚠️ Batch | ✅ | $ |
+
+**Decision: PostgreSQL**
+- ✅ ACID (audit logs are critical)
+- ✅ SQL for ad-hoc queries
+- ✅ JSONB for flexible schema
+- ❌ Tradeoff: Slower than Elasticsearch for full-text search
+
+**When to use Elasticsearch instead:**
+- Need full-text search (e.g., "find all errors containing 'timeout'")
+- Log volume > 1TB/day
+- Real-time log aggregation (ELK stack)
+
+---
+
+### Monitoring: Prometheus + Grafana
+
+**Why This Stack?**
+
+**Prometheus:**
+- Industry standard for time-series metrics
+- Pull-based model (gateway exposes `/metrics` endpoint)
+- PromQL query language
+- Built-in alerting (Alertmanager)
+
+**Grafana:**
+- Visualization layer for Prometheus
+- Pre-built dashboards
+- Multi-datasource support
+
+**Alternatives:**
+
+| Stack | Pros | Cons |
+|-------|------|------|
+| **Datadog** | Managed, APM, Logs | $$$$ |
+| **New Relic** | Easy setup, AI alerts | $$$ |
+| **CloudWatch** | Native AWS | AWS lock-in |
+| **Prometheus + Grafana** | Free, flexible | Self-hosted |
+
+**Decision: Prometheus + Grafana**
+- ✅ Open-source (no per-host billing)
+- ✅ Full control (custom queries)
+- ❌ Tradeoff: Need to manage infrastructure
+
+**When to use Datadog instead:**
+- Budget > $100k/year
+- Want managed service
+- Need APM (application performance monitoring)
+
+---
+
+## Architectural Patterns
+
+### 1. Filter Chain Pattern
+
+**Problem:** Request needs multi-step processing.
+
+**Solution:** Chain of Responsibility
+
+```java
+Client Request
+    ↓
+[JwtAuthFilter]
+    ↓ (if valid)
+[RateLimitFilter]
+    ↓ (if not throttled)
+[RequestRouter]
+    ↓
+Backend
+```
+
+**Benefits:**
+- ✅ Each filter has single responsibility
+- ✅ Easy to add new filters (e.g., IP allowlist)
+- ✅ Testable in isolation
+
+**Code:**
+```java
+@Component
+@Order(1)
+public class JwtAuthFilter implements Filter {
+    @Override
+    public void doFilter(ServletRequest request, ...) {
+        // Validate JWT
+        if (invalid) {
+            response.sendError(401);
+            return;  // Stop chain
+        }
+        chain.doFilter(request, response);  // Continue
+    }
+}
+
+@Component
+@Order(2)
+public class RateLimitFilter implements Filter {
+    // Similar pattern
+}
 ```
 
 ---
 
-## 3. High-Level Architecture
+### 2. Token Bucket Algorithm
 
+**Problem:** Rate limiting with burst tolerance.
+
+**Why Token Bucket?**
+
+**Comparison:**
+
+| Algorithm | Allows Burst | Smooth Rate | Implementation |
+|-----------|--------------|-------------|----------------|
+| **Fixed Window** | ❌ | ❌ | Easy |
+| **Sliding Window** | ❌ | ✅ | Medium |
+| **Leaky Bucket** | ❌ | ✅ | Medium |
+| **Token Bucket** | ✅ | ✅ | Medium |
+
+**Token Bucket Mechanics:**
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │              BLACKBOX GATEWAY                │
-                    │                                             │
-  Client ──────────►│  [JWT Filter] → [Rate Limiter] → [Router]  │────► Backend
-  (with JWT)       │       │              │               │       │     Services
-                    │       │              │               │       │
-                    │       ▼              ▼               ▼       │
-                    │   Reject 401    Reject 429     Circuit Break │
-                    │                                  503         │
-                    └──────┬──────────────┬───────────────┬────────┘
-                           │              │               │
-                           ▼              ▼               ▼
-                      ┌─────────┐   ┌──────────┐   ┌────────────┐
-                      │PostgreSQL│   │  Redis   │   │ Prometheus │
-                      │(configs, │   │(buckets, │   │ (metrics)  │
-                      │ audit)   │   │ locks,   │   │            │
-                      │          │   │ circuit) │   │            │
-                      └─────────┘   └──────────┘   └─────┬──────┘
-                                                         │
-                                                         ▼
-                                                   ┌──────────┐
-                                                   │ Grafana  │
-                                                   │(dashboards│
-                                                   │ alerts)  │
-                                                   └──────────┘
+Bucket size: 750 tokens (burst)
+Refill rate: 500 tokens/second
+
+Second 0: 750 tokens (full)
+User makes 100 requests → 650 tokens left
+Second 1: 650 + 500 (refill) = 1150 → capped at 750
+User makes 700 requests → 50 tokens left
+Second 2: 50 + 500 = 550 tokens
 ```
 
-### Component Responsibilities
+**Real-world analogy:** Water tank
+- Tank capacity: 750 liters
+- Faucet adds: 500 liters/second
+- User consumes: Variable
+- Tank never overflows (capped at 750)
 
-| Component | What It Does | What It Does NOT Do |
-|-----------|-------------|-------------------|
-| **Gateway (Spring Boot)** | Routes requests, validates JWTs, enforces rate limits, breaks circuits | Does NOT transform request/response bodies |
-| **Redis** | Stores token bucket state, distributed locks, circuit breaker counters | Does NOT persist data (ephemeral by design) |
-| **PostgreSQL** | Stores client configs, rate limit tiers, audit logs | Does NOT serve hot-path decisions |
-| **Prometheus** | Scrapes gateway metrics every 15s | Does NOT make control decisions |
-| **Grafana** | Visualizes metrics, fires alert rules | Does NOT feed back into the gateway |
-| **Mock Backend** | Simulates downstream service (configurable latency/errors) | Is NOT a real service |
+**Implementation (Lua in Redis):**
+```lua
+local tokens = tonumber(redis.call('get', KEYS[1]) or capacity)
+local now = tonumber(ARGV[1])
+local lastRefill = tonumber(redis.call('get', KEYS[2]) or now)
 
-### Request Flow (Happy Path)
+-- Calculate refill
+local elapsed = now - lastRefill
+local addTokens = elapsed * refillRate
+tokens = math.min(capacity, tokens + addTokens)
 
+-- Try to consume
+if tokens >= 1 then
+    tokens = tokens - 1
+    redis.call('set', KEYS[1], tokens)
+    redis.call('set', KEYS[2], now)
+    return 1  -- Allow
+else
+    return 0  -- Reject
+end
 ```
-1. Client sends request with JWT in Authorization header
-2. JwtAuthFilter validates token signature + expiry
-   → Invalid? Return 401 Unauthorized
-3. RateLimitFilter checks Redis token bucket for client ID
-   → Exhausted? Return 429 Too Many Requests + Retry-After header
-4. RequestRouter forwards to backend via WebClient
-   → Circuit open? Return 503 Service Unavailable
-5. Response returned to client
-6. Metrics recorded: latency, status, client tier
-```
 
-### Request Flow (Redis Down)
-
-```
-1–2. Same as happy path
-3. RateLimitFilter: Redis unreachable
-   → Fall back to local in-memory rate limiter
-   → Use CONSERVATIVE limits (50% of normal)
-   → Log degradation event
-   → Increment gateway_fallback_total metric
-4–6. Same as happy path
-```
+**Why Lua?**
+- Executes atomically on Redis
+- No race condition between GET and SET
 
 ---
 
-## 4. Core Design Decisions
+### 3. Circuit Breaker Pattern
 
-### Decision 1: Redis-Backed Token Buckets (Not In-Memory)
+**Problem:** Cascading failures
 
-**Chose:** Centralized Redis token buckets with Lua scripts for atomicity
-
-**Alternatives considered:**
-- **In-memory (Guava RateLimiter):** Simple, zero latency. But each gateway instance has independent state. Client can send N × instances requests before being throttled.
-- **Database-backed:** Durable, but 5–10ms per check. Unacceptable on the hot path.
-- **Distributed in-memory (Hazelcast):** Consistent, but adds operational complexity and a new failure mode.
-
-**Why Redis wins:**
-- Atomic Lua scripts = no race conditions
-- ~1ms round trip (acceptable overhead)
-- Shared state across all gateway instances
-- Well-understood failure modes
-- Easy to monitor and debug
-
-**Trade-off accepted:** Redis is a single point of failure. Mitigated by local fallback (Decision 3).
-
----
-
-### Decision 2: Adaptive Rate Adjustment (Not Static Thresholds)
-
-**Chose:** Background controller that monitors error rates and adjusts bucket parameters
-
-**How it works:**
+**Without Circuit Breaker:**
 ```
-Every 10 seconds:
-  error_rate = downstream_5xx_count / total_requests (last 60s window)
-
-  IF error_rate > 50%:
-    refill_rate = refill_rate * 0.5  (halve — aggressive protection)
-    mode = TIGHTENED
-
-  ELSE IF error_rate > 20%:
-    refill_rate = refill_rate * 0.8  (reduce gradually)
-    mode = CAUTIOUS
-
-  ELSE IF error_rate < 5% for 120 seconds:
-    refill_rate = min(refill_rate * 1.2, default_rate)  (gradually restore)
-    mode = RECOVERING
-
-  ELSE:
-    mode = NORMAL
+Payment Service down
+→ Gateway keeps trying
+→ Each request waits 5 seconds (timeout)
+→ Gateway thread pool exhausted
+→ Gateway can't handle other requests
+→ Entire system appears down!
 ```
 
-**Why not ML/AI-based prediction?**
-- Adds complexity without proportional value
-- Hard to debug ("why did the model throttle this client?")
-- Simple heuristics are explainable and tunable
-- Non-goal: perfection. Goal: fast, safe, understandable.
-
-**Trade-off accepted:** May throttle legitimate users during backend incidents. Protecting the system > perfect fairness.
-
----
-
-### Decision 3: Graceful Degradation (Not Fail-Open or Fail-Closed)
-
-**Chose:** Layered fallback with conservative defaults
-
-**The spectrum:**
+**With Circuit Breaker:**
 ```
-Fail-Open:  If Redis is down, allow ALL traffic → Dangerous
-Fail-Closed: If Redis is down, block ALL traffic → Availability disaster
-Fail-Safe:   If Redis is down, allow traffic with STRICTER local limits → Our choice
+Payment Service fails 5 times
+→ Circuit OPENS (fail fast)
+→ Return 503 immediately (no 5s wait)
+→ Gateway thread pool stays healthy
+→ Other routes (users, products) still work!
 ```
 
-**Why fail-safe:**
-- Maintains protection (local limiter still works)
-- Maintains availability (clients aren't locked out)
-- Accepts imperfect rate counting during degradation
-- Alerts fire immediately so humans can investigate
+**State Machine:**
 
----
-
-### Decision 4: Circuit Breaker Per Route (Not Global)
-
-**Chose:** Independent circuit breaker per downstream route
-
-**Why not global?**
-- If `/api/payments` backend is down but `/api/users` is healthy, we shouldn't block user requests
-- Per-route isolation limits blast radius
-- Each route has its own failure threshold and cooldown
-
-**State machine:**
 ```
-CLOSED ──(N failures)──► OPEN ──(cooldown)──► HALF_OPEN
-   ▲                                              │
-   └──────────(M successes)────────────────────────┘
-                                                   │
-                          (failure in half-open)    │
-                     OPEN ◄────────────────────────┘
+CLOSED (normal)
+  │ 5 consecutive failures
+  ▼
+OPEN (blocking)
+  │ 30 seconds cooldown
+  ▼
+HALF_OPEN (testing)
+  ├─ Success → CLOSED
+  └─ Failure → OPEN
 ```
 
----
+**Metrics:**
+- **Failure threshold:** 5 failures (why not 1? Transient errors exist)
+- **Cooldown:** 30 seconds (why not 5 min? Too long for users to wait)
+- **Half-open probes:** 1 request (why not 10? Don't overwhelm recovering backend)
 
-## 5. Goals, Non-Goals, and Trade-Offs
-
-### Goals
-- ✅ Protect downstream services from traffic spikes and abuse automatically
-- ✅ Adapt rate limits based on real-time system health
-- ✅ Survive infrastructure failures (Redis, DB, backend) without crashing
-- ✅ Provide clear observability into every decision the gateway makes
-- ✅ Return meaningful error responses (429 with Retry-After, 503 with reason)
-
-### Non-Goals
-- ❌ Perfect rate limit accuracy across distributed instances (consistency vs availability trade-off)
-- ❌ Zero added latency (we accept ~1-2ms for Redis round-trip)
-- ❌ Request/response transformation (not an API management platform)
-- ❌ GUI admin panel (config via YAML/DB, not UI)
-- ❌ Multi-region deployment (single-region, free-tier scope)
-- ❌ ML-based traffic prediction (explainability > sophistication)
-
-### Explicit Trade-Offs
-
-| We Chose | Over | Because |
-|----------|------|---------|
-| Redis (external state) | In-memory (local state) | Multi-instance consistency |
-| Simple heuristics | ML prediction | Debuggability and explainability |
-| Conservative fallback | Fail-open | Safety during degradation |
-| Per-route circuit breakers | Global breaker | Blast radius isolation |
-| 1ms latency overhead | Zero overhead | Correctness of rate limiting |
-| Eventual consistency | Strong consistency | Availability under partition |
+**Real-world analogy:** Electrical circuit breaker
+- **CLOSED:** Current flows (requests allowed)
+- **OPEN:** Current blocked (requests rejected)
+- **HALF_OPEN:** Testing if issue resolved
 
 ---
 
-## 6. Technology Choices
+### 4. Adaptive Control Loop
 
-| Technology | Version | Why |
-|-----------|---------|-----|
-| Java | 17 | Standard thread pool for gateway I/O |
-| Spring Boot | 3.2+ | WebFlux for reactive request routing |
-| Redis | 7.x | Lua scripting, pub/sub for config propagation |
-| PostgreSQL | 16 | JSONB for flexible config, strong audit support |
-| Prometheus | Latest | Pull-based metrics, PromQL for alerting |
-| Grafana | Latest | Dashboard visualization, alert routing |
-| Docker Compose | 3.8+ | Local development orchestration |
-| k6 | Latest | Scriptable load testing |
-| JUnit 5 + Testcontainers | Latest | Integration tests with real Redis/PostgreSQL |
+**Problem:** Static limits don't adapt to backend capacity.
 
----
+**Solution:** Feedback loop
 
-## 7. Security Considerations
+```
+┌─────────────────────────────────────┐
+│   Observe Error Rate Every 10s      │
+└────────────┬────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────┐
+│   Calculate New Multiplier          │
+│   - Error >50%: Halve (0.5x)        │
+│   - Error <5%:  Restore (1.0x)      │
+└────────────┬────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────┐
+│   Apply to All Rate Limits          │
+│   PREMIUM: 500 * 0.5 = 250 req/s    │
+└────────────┬────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────┐
+│   Publish to Redis                  │
+│   (Other instances pick up change)  │
+└─────────────────────────────────────┘
+```
 
-### Authentication
-- JWT (HMAC-SHA256) validated at gateway edge
-- No request reaches backend without valid token
-- Token expiry enforced (reject expired tokens, no grace period)
+**Why 10 second intervals?**
+- Too fast (1s): React to transient spikes
+- Too slow (60s): Backend crashes before adjustment
+- 10s: Balance responsiveness vs stability
 
-### Rate Limit Bypass Prevention
-- Client identity extracted from JWT claims (not IP-based, IPs can be shared/spoofed)
-- Rate limit keys include client ID + route
-- Burst protection: bucket size limits instantaneous spikes
+**Why error thresholds (50%, 5%)?**
+- 50%: Clearly unhealthy (not transient)
+- 5%: Healthy enough to restore
+- Gap (5-50%): Prevents oscillation
 
-### Secrets Management
-- JWT signing key via environment variable (not hardcoded)
-- Redis password via environment variable
-- PostgreSQL credentials via environment variable
-- In production: would use Vault or cloud KMS
-
----
-
-## 8. What I Would Change at 10× Scale
-
-| Current Design | At 10× Scale |
-|---------------|-------------|
-| Single Redis instance | Redis Cluster (sharded by client ID) |
-| Sync Redis calls on hot path | Redis pipeline + local cache hybrid |
-| Single-region | Multi-region with regional rate limits |
-| Prometheus pull | Push-based metrics (OTLP) for lower overhead |
-| Docker Compose | Kubernetes with HPA |
-| Background adaptive controller | Dedicated control-plane service |
-| In-process circuit breaker | Service mesh (Istio) circuit breaking |
-| PostgreSQL for audit | Kafka → S3 for high-volume audit streaming |
-
-These were intentionally avoided to keep the system understandable and free-tier compatible.
+**Alternative: PID Controller**
+- More sophisticated (Proportional-Integral-Derivative)
+- Used in industrial control systems
+- ❌ Overkill for this use case
+- ✅ Simple thresholds work fine
 
 ---
 
-## 9. Blog Notes (for Day 7)
+## Design Tradeoffs
 
-### Why Static Rate Limiting Fails
-- The 3 AM PagerDuty story
-- Static limits optimize for one traffic pattern
-- The fairness vs protection tension
-- Why "just set a higher limit" doesn't work
+### Tradeoff 1: JWT vs Sessions
 
-### What Was Intentionally Ignored
-- ML/AI prediction (explainability matters more)
-- Perfect accuracy (availability > consistency)
-- GUI admin panel (YAGNI for this scope)
-- Multi-region (free-tier scope, but designed for it)
+| Aspect | JWT | Session |
+|--------|-----|---------|
+| **Scalability** | ✅ Stateless | ❌ Needs shared store |
+| **Revocation** | ❌ Can't revoke until expiry | ✅ Delete from store |
+| **Size** | ❌ ~800 bytes | ✅ ~36 bytes (ID) |
+| **Latency** | ✅ No DB lookup | ❌ Redis/DB lookup |
+
+**BLACKBOX Choice: JWT**
+- Prioritize: Scalability, latency
+- Accept: Can't revoke (mitigate with short expiry: 15 min)
+
+**When to use Sessions:**
+- Need instant revocation (e.g., "log out all devices")
+- Token size matters (mobile apps on 3G)
+
+---
+
+### Tradeoff 2: Synchronous vs Asynchronous Processing
+
+**Current: Synchronous**
+```java
+public void route(HttpServletRequest request, ...) {
+    // Block until backend responds
+    byte[] response = webClient.retrieve()
+        .bodyToMono(byte[].class)
+        .block();  // ← Synchronous!
+}
+```
+
+**Alternative: Async (WebFlux)**
+```java
+public Mono<ResponseEntity> route(...) {
+    return webClient.retrieve()
+        .bodyToMono(byte[].class)
+        .map(ResponseEntity::ok);  // Non-blocking
+}
+```
+
+| Aspect | Sync (Current) | Async (WebFlux) |
+|--------|----------------|-----------------|
+| **Throughput** | ⭐⭐⭐ (200 threads) | ⭐⭐⭐⭐⭐ (Event loop) |
+| **Latency** | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| **Code Complexity** | ⭐⭐⭐⭐⭐ (Easy) | ⭐⭐ (Reactive harder) |
+| **Debugging** | ⭐⭐⭐⭐⭐ | ⭐⭐ (Stack traces hard) |
+
+**BLACKBOX Choice: Synchronous**
+- Throughput adequate (500 req/s)
+- Code simplicity > marginal gains
+- Team familiarity with synchronous code
+
+**When to use Async:**
+- Need >10,000 req/s
+- I/O-bound (waiting on slow backends)
+- Team experienced with reactive programming
+
+---
+
+### Tradeoff 3: Single Gateway vs Microgateway Per Service
+
+**Option 1: Single Gateway (BLACKBOX)**
+```
+All Clients → BLACKBOX Gateway → All Backends
+```
+✅ Centralized policy  
+✅ Single point of monitoring  
+❌ Single point of failure  
+❌ All services share rate limit pool  
+
+**Option 2: Microgateway**
+```
+Clients → Payment Gateway → Payment Service
+Clients → User Gateway → User Service
+```
+✅ Isolated blast radius  
+✅ Independent deployment  
+❌ Policy duplication  
+❌ Monitoring fragmentation  
+
+**BLACKBOX Choice: Single Gateway**
+- Org size: Small (<10 teams)
+- Deployment: Monorepo OK
+- Failure: Mitigated with HA (multiple instances)
+
+**When to use Microgateway:**
+- Large org (>50 teams)
+- Service autonomy critical
+- Different SLAs per service
+
+---
+
+## Scalability Considerations
+
+### Horizontal Scaling
+
+**Current Setup:**
+```
+Load Balancer
+    ├─ Gateway Instance 1
+    ├─ Gateway Instance 2
+    └─ Gateway Instance N
+```
+
+**Shared State:**
+- Redis: Rate limit counters
+- PostgreSQL: Audit logs
+
+**Bottlenecks:**
+
+1. **Redis Connection Pool**
+   - Limit: 100 connections/instance
+   - Fix: Increase pool size or use Redis Cluster
+
+2. **PostgreSQL Writes**
+   - Limit: ~10,000 writes/second
+   - Fix: Batch inserts, use TimescaleDB
+
+3. **Circuit Breaker State**
+   - Current: Per-instance (not shared)
+   - Risk: Instance 1 opens circuit, Instance 2 doesn't know
+   - Fix: Store circuit state in Redis
+
+**Capacity Planning:**
+
+| Metric | Single Instance | 10 Instances |
+|--------|-----------------|--------------|
+| **Throughput** | 500 req/s | 5,000 req/s |
+| **Latency p95** | 60ms | 65ms |
+| **Memory** | 500MB | 5GB |
+| **CPU** | 1 core | 10 cores |
+
+---
+
+### Vertical Scaling
+
+**Current:** 1 CPU, 1GB RAM
+
+**Limits:**
+- CPU: ~2,000 req/s (becomes bottleneck)
+- Memory: 500MB used, 1GB sufficient
+
+**When to vertical scale:**
+- Horizontal scaling expensive (licensing)
+- Single-tenant deployment
+- Quick fix before horizontal scaling
+
+**Recommendation:** Horizontal scaling (commodity hardware)
+
+---
+
+## Security Architecture
+
+### Authentication Flow
+
+```
+1. Client generates JWT offline (or via /test/token)
+   Claims: {sub: "clientId", tier: "PREMIUM", exp: 15min}
+
+2. Client includes in header:
+   Authorization: Bearer eyJhbGciOiJIUzUxMiJ9...
+
+3. Gateway validates:
+   - Signature (HMAC-SHA512)
+   - Expiration (not expired)
+   - Claims (clientId exists)
+
+4. If valid → proceed
+   If invalid → 401 Unauthorized
+```
+
+**Security Properties:**
+- ✅ Stateless (scales)
+- ✅ Tamper-proof (signature verification)
+- ✅ Time-limited (15 min expiry)
+- ❌ Can't revoke (accept as tradeoff)
+
+**Secret Management:**
+```yaml
+# application.yml
+gateway:
+  jwt:
+    secret: ${JWT_SECRET:fallback-dev-secret}
+```
+
+**Production:**
+```bash
+# Set via environment variable
+export JWT_SECRET=$(openssl rand -base64 32)
+
+# Or use secret manager
+kubectl create secret generic jwt-secret \
+  --from-literal=JWT_SECRET=<actual-secret>
+```
+
+**Never commit secrets to git!**
+
+---
+
+### Rate Limiting Security
+
+**Attack: Bypass via Multiple IPs**
+```
+Attacker uses 100 IPs
+Each IP gets 100 req/s
+Total: 10,000 req/s (bypassed limit!)
+```
+
+**Current Mitigation:**
+- Rate limit by `clientId` (in JWT), not IP
+- Attacker needs 100 valid JWTs (harder)
+
+**Future Enhancement:**
+- IP-based rate limiting (additional layer)
+- CAPTCHA after N failed auth attempts
+
+---
+
+### Audit Logging Security
+
+**Requirements:**
+- Immutable (can't edit past logs)
+- Complete (all significant events)
+- Tamper-evident (detect modifications)
+
+**Implementation:**
+```java
+AuditLog.builder()
+    .eventType("RATE_LIMIT_ADJUST")
+    .source("AdaptiveRateLimitController")
+    .timestamp(Instant.now())  // UTC
+    .details(jsonDetails)
+    .build();
+
+repository.save(auditLog);  // Append-only
+```
+
+**Postgres Configuration:**
+```sql
+-- No UPDATE/DELETE allowed
+REVOKE UPDATE, DELETE ON audit_log FROM app_user;
+GRANT INSERT, SELECT ON audit_log TO app_user;
+```
+
+**Compliance:**
+- SOC 2: Audit logs for all access
+- PCI DSS: Log authentication events
+- GDPR: Log personal data access
+
+---
+
+## Summary
+
+**BLACKBOX Architecture Principles:**
+
+1. **Simplicity over Complexity**
+   - Simple thresholds > ML models
+   - Synchronous > Async (when sufficient)
+
+2. **Proven Technologies**
+   - Spring Boot (enterprise standard)
+   - Redis (industry standard for caching)
+   - Prometheus (CNCF graduated project)
+
+3. **Explicit Tradeoffs**
+   - JWT (scalability) over Sessions (revocation)
+   - Single gateway (centralization) over Microgateways (isolation)
+
+4. **Observable by Default**
+   - Metrics: Prometheus
+   - Logs: PostgreSQL audit
+   - Dashboards: Grafana
+
+5. **Secure by Design**
+   - Authentication required (JWT)
+   - Rate limiting enforced
+   - Audit trail complete
+
+**Next:** See `DEVELOPMENT.md` for hands-on implementation and `CONTRIBUTING.md` for collaboration guidelines.

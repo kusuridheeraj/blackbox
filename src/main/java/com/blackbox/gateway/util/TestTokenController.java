@@ -28,13 +28,30 @@ public class TestTokenController {
         String tier = request.getOrDefault("tier", "STANDARD");
         String name = request.getOrDefault("name", "Test Client");
 
-        String token = tokenGenerator.generateToken(clientId, tier, name);
+        return ResponseEntity.ok(buildTokenResponse(clientId, tier, name));
+    }
 
-        return ResponseEntity.ok(Map.of(
+    /**
+     * GET version — works from PowerShell without JSON escaping issues.
+     * Usage: curl
+     * http://localhost:8080/test/token?clientId=client-1&tier=STANDARD&name=Test
+     */
+    @GetMapping("/token")
+    public ResponseEntity<Map<String, String>> generateTokenGet(
+            @RequestParam(defaultValue = "test-client") String clientId,
+            @RequestParam(defaultValue = "STANDARD") String tier,
+            @RequestParam(defaultValue = "Test Client") String name) {
+
+        return ResponseEntity.ok(buildTokenResponse(clientId, tier, name));
+    }
+
+    private Map<String, String> buildTokenResponse(String clientId, String tier, String name) {
+        String token = tokenGenerator.generateToken(clientId, tier, name);
+        return Map.of(
                 "token", token,
                 "clientId", clientId,
                 "tier", tier,
-                "usage", "Authorization: Bearer " + token));
+                "usage", "Authorization: Bearer " + token);
     }
 
     @PostMapping("/token/expired")

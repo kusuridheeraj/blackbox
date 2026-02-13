@@ -44,8 +44,8 @@ gateway:
         requests-per-second: 50
         burst-size: 75
       PREMIUM:
-        requests-per-second: 200
-        burst-size: 300
+        requests-per-second: 500
+        burst-size: 750
       INTERNAL:
         requests-per-second: 1000
         burst-size: 1500

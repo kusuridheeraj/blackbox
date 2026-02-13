@@ -19,7 +19,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 public class WebConfig {
 
     @Bean
-    public FilterRegistrationBean<JwtAuthFilter> jwtFilter(JwtAuthFilter filter) {
+    public FilterRegistrationBean<JwtAuthFilter> jwtFilterRegistration(JwtAuthFilter filter) {
         FilterRegistrationBean<JwtAuthFilter> registration = new FilterRegistrationBean<>();
         registration.setFilter(filter);
         registration.addUrlPatterns("/api/*");
@@ -28,7 +28,7 @@ public class WebConfig {
     }
 
     @Bean
-    public FilterRegistrationBean<RateLimitFilter> rateLimitFilter(RateLimitFilter filter) {
+    public FilterRegistrationBean<RateLimitFilter> rateLimitFilterRegistration(RateLimitFilter filter) {
         FilterRegistrationBean<RateLimitFilter> registration = new FilterRegistrationBean<>();
         registration.setFilter(filter);
         registration.addUrlPatterns("/api/*");

@@ -1,5 +1,5 @@
-# PostgreSQL schema for BLACKBOX audit logging
-# Automatically run by PostgreSQL on container initialization
+-- PostgreSQL schema for BLACKBOX audit logging
+-- Automatically run by PostgreSQL on container initialization
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id BIGSERIAL PRIMARY KEY,

@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Enumeration;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Request Router.
@@ -47,6 +48,7 @@ public class RequestRouter {
     private final AdaptiveRateLimitController adaptiveController;
 
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5);
+    private final java.util.Set<String> registeredRoutes = ConcurrentHashMap.newKeySet();
 
     /**
      * Forward the request to the matching backend route.
@@ -60,6 +62,11 @@ public class RequestRouter {
         if (route == null) {
             sendError(response, uri, HttpStatus.NOT_FOUND, "No route found for: " + uri);
             return;
+        }
+
+        // Register circuit breaker gauge on first use
+        if (registeredRoutes.add(route.getId())) {
+            circuitBreaker.registerRouteGauge(route.getId());
         }
 
         // Check circuit breaker
